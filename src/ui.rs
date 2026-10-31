@@ -3,15 +3,22 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState};
 
-use crate::app::App;
+use crate::app::{App, Mode};
 use crate::format::{humanize_age, progress_bar};
 use crate::metrics::{liveness, milestone_progress as milestone_pct};
 use crate::model::{Liveness, Metrics};
 
-/// Draws the whole dashboard into `f`. Diff-only rendering: no clears, no stdout.
+/// Draws the current screen into `f`. Diff-only rendering: no clears, no stdout.
 pub fn render(f: &mut Frame, app: &App) {
+    match app.mode {
+        Mode::Dashboard => render_dashboard(f, app),
+        Mode::Picker => render_picker(f, app),
+    }
+}
+
+fn render_dashboard(f: &mut Frame, app: &App) {
     let [title_area, hero_area, table_area, summary_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(5),
@@ -29,7 +36,62 @@ pub fn render(f: &mut Frame, app: &App) {
     f.render_stateful_widget(project_table(app), table_area, &mut table_state);
     f.render_widget(Paragraph::new(summary(app)), summary_area);
     f.render_widget(
-        Paragraph::new("↑↓ move   ⏎ open repo   s sort   r refresh   q quit"),
+        Paragraph::new("↑↓ move   ⏎ open repo   s sort   r refresh   a add repos   q quit"),
+        footer_area,
+    );
+}
+
+/// Draws the pin picker: a filter line, the filtered candidates with their
+/// pin state, and a key footer. Reads state through `app.picker`; with no
+/// picker state it draws an empty frame.
+fn render_picker(f: &mut Frame, app: &App) {
+    let [title_area, filter_area, list_area, footer_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(f.area());
+
+    let Some(picker) = app.picker.as_ref() else {
+        return;
+    };
+
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Add repos — type to filter",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        title_area,
+    );
+    f.render_widget(
+        Paragraph::new(format!("filter: {}▏", picker.filter)),
+        filter_area,
+    );
+
+    let filtered = picker.filtered();
+    let items: Vec<ListItem<'static>> = filtered
+        .iter()
+        .map(|&idx| {
+            let repo = picker.candidates[idx].to_string();
+            let mark = if picker.pinned.contains(&repo) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            ListItem::new(format!("{mark} {repo}"))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(Block::bordered().title("repos"));
+    // Stateful so ratatui scrolls the cursor row into view.
+    let mut list_state =
+        ListState::default().with_selected((!filtered.is_empty()).then_some(picker.cursor));
+    f.render_stateful_widget(list, list_area, &mut list_state);
+
+    f.render_widget(
+        Paragraph::new("type to filter · ↑↓ move · space toggle · enter save · esc cancel"),
         footer_area,
     );
 }
@@ -334,6 +396,34 @@ mod tests {
         assert!(
             row_is_reversed(&terminal, y),
             "scrolled-in row not highlighted"
+        );
+    }
+
+    fn picker_app() -> App {
+        let mut app = App::new(None, Sort::Name);
+        let candidates = vec![
+            RepoRef::parse("octo/alpha").unwrap(),
+            RepoRef::parse("octo/beta").unwrap(),
+        ];
+        let pinned = vec![RepoRef::parse("octo/beta").unwrap()];
+        app.open_picker(candidates, &pinned);
+        app.mode = Mode::Picker;
+        app
+    }
+
+    #[test]
+    fn picker_lists_candidates_with_pin_checkboxes_and_footer() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let app = picker_app();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Add repos"), "missing picker title:\n{text}");
+        assert!(text.contains("octo/alpha"), "missing candidate:\n{text}");
+        assert!(text.contains("[ ] octo/alpha"), "unpinned row:\n{text}");
+        assert!(text.contains("[x] octo/beta"), "pinned row:\n{text}");
+        assert!(
+            text.contains("esc cancel"),
+            "missing picker footer:\n{text}"
         );
     }
 
