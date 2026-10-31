@@ -98,30 +98,38 @@ mod tests {
         }
     }
 
-    fn scratch_dir() -> PathBuf {
-        env::temp_dir().join(format!("projstat-cache-test-{}", std::process::id()))
+    /// Per-test scratch directory, so parallel tests never share or delete
+    /// each other's files.
+    fn scratch_dir(test: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "projstat-cache-test-{}-{}",
+            std::process::id(),
+            test
+        ))
     }
 
     #[test]
     fn round_trip_through_temp_path_equals_original() {
-        let path = scratch_dir().join("nested").join("cache.json");
+        let dir = scratch_dir("roundtrip");
+        let path = dir.join("nested").join("cache.json");
         let original = sample();
         save_to(&path, &original).expect("save succeeds and creates parent dirs");
         let loaded = load_from(&path).expect("load returns the saved cache");
         assert_eq!(loaded, original);
-        let _ = std::fs::remove_dir_all(scratch_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_missing_or_corrupt_file_returns_none() {
-        let missing = scratch_dir().join("does-not-exist.json");
+        let dir = scratch_dir("missing_or_corrupt");
+        let missing = dir.join("does-not-exist.json");
         assert!(load_from(&missing).is_none());
 
-        let corrupt = scratch_dir().join("corrupt").join("cache.json");
+        let corrupt = dir.join("corrupt").join("cache.json");
         std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
         std::fs::write(&corrupt, "{ not json").unwrap();
         assert!(load_from(&corrupt).is_none());
-        let _ = std::fs::remove_dir_all(scratch_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
