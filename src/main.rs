@@ -1,3 +1,4 @@
+mod config;
 mod format;
 mod gh;
 mod metrics;
