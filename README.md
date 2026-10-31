@@ -85,9 +85,17 @@ No config file yet? `projstat` opens to an empty dashboard and tells you how to 
 |-----|--------|
 | `↑` / `↓` (`k` / `j`) | Move selection |
 | `⏎` | Open the selected repo on GitHub |
+| `a` | Add/manage pinned repos (opens the picker) |
 | `s` | Cycle sort |
 | `r` | Refresh now |
 | `q` / `Esc` | Quit |
+
+### Adding repos
+
+Press `a` to open the repo picker — no editing `config.toml` by hand. It lists
+the repos it discovers (your account plus any `discover_orgs`); **type to
+filter**, `↑`/`↓` to move, `Space` to pin/unpin, `Enter` to save, `Esc` to
+cancel. Saving writes your pins back to `config.toml` and refreshes the board.
 
 ## Roadmap
 
