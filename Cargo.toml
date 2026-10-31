@@ -14,3 +14,5 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 toml = "0.9"
 tokio = { version = "1", features = ["full"] }
+ratatui = "0.30"
+crossterm = { version = "0.28", features = ["event-stream"] }
