@@ -168,7 +168,14 @@ pub async fn fetch_metrics(repo: &RepoRef) -> anyhow::Result<Metrics> {
         gh_api(&opened_path, None),
         gh_api(&releases_path, Some("length")),
         gh_api(&repo_path, Some(".pushed_at")),
-        gh_api(&issues_path, Some(".[0].updated_at // empty")),
+        // Issues disabled (HTTP 410) or any failure: no issue activity, not a repo failure.
+        async {
+            Ok::<_, anyhow::Error>(
+                gh_api(&issues_path, Some(".[0].updated_at // empty"))
+                    .await
+                    .unwrap_or_default(),
+            )
+        },
     )?;
     let last_activity = latest_activity(&pushed, &issue_updated)?;
 
