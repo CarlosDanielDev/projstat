@@ -13,13 +13,7 @@ pub fn milestone_progress(open: u32, closed: u32) -> f64 {
 }
 
 pub fn closeness(progress: f64) -> f64 {
-    if progress < 0.0 {
-        0.0
-    } else if progress > 1.0 {
-        1.0
-    } else {
-        progress
-    }
+    progress.clamp(0.0, 1.0)
 }
 
 pub fn pick_score(momentum: i32, closeness: f64) -> f64 {

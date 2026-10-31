@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use anyhow::Context;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::Metrics;
@@ -37,11 +37,6 @@ pub fn load() -> Option<Cache> {
     load_from(&cache_path())
 }
 
-/// True when the snapshot is older than `max_age_secs`.
-pub fn is_stale(c: &Cache, max_age_secs: i64) -> bool {
-    is_stale_at(c, max_age_secs, Utc::now())
-}
-
 fn save_to(path: &Path, c: &Cache) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -56,15 +51,11 @@ fn load_from(path: &Path) -> Option<Cache> {
     serde_json::from_str(&text).ok()
 }
 
-fn is_stale_at(c: &Cache, max_age_secs: i64, now: DateTime<Utc>) -> bool {
-    now - c.fetched_at > Duration::seconds(max_age_secs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Milestone, RepoRef};
-    use chrono::TimeZone;
+    use chrono::{Duration, TimeZone};
 
     fn sample() -> Cache {
         let fetched_at = Utc.with_ymd_and_hms(2026, 10, 30, 12, 0, 0).unwrap();
@@ -130,26 +121,6 @@ mod tests {
         std::fs::write(&corrupt, "{ not json").unwrap();
         assert!(load_from(&corrupt).is_none());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn is_stale_true_when_older_than_max_age() {
-        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
-        let c = Cache {
-            fetched_at: now - Duration::seconds(601),
-            metrics: vec![],
-        };
-        assert!(is_stale_at(&c, 600, now));
-    }
-
-    #[test]
-    fn is_stale_false_when_fresh() {
-        let now = Utc.with_ymd_and_hms(2026, 10, 31, 12, 0, 0).unwrap();
-        let c = Cache {
-            fetched_at: now - Duration::seconds(30),
-            metrics: vec![],
-        };
-        assert!(!is_stale_at(&c, 600, now));
     }
 
     #[test]

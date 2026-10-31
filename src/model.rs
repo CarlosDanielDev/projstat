@@ -52,13 +52,6 @@ pub struct Metrics {
     pub releases_shipped: u32,
 }
 
-/// A repository selected for display, with its ranking score.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Pick {
-    pub repo: RepoRef,
-    pub score: f64,
-}
-
 /// How recently a repository has been active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liveness {
