@@ -5,6 +5,40 @@ use crate::config::Sort;
 use crate::metrics;
 use crate::model::{Metrics, RepoRef};
 
+/// Which screen is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)] // unused until the picker UI lands (task B)
+pub enum Mode {
+    #[default]
+    Dashboard,
+    Picker,
+}
+
+/// State of the in-TUI pin picker. `pinned` holds `owner/name` strings.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // unused until the picker UI lands (task B)
+pub struct PickerState {
+    pub candidates: Vec<RepoRef>,
+    pub pinned: std::collections::BTreeSet<String>,
+    pub filter: String,
+    pub cursor: usize,
+}
+
+impl PickerState {
+    /// Indices into `candidates` whose display string contains `filter`
+    /// (case-insensitive), in candidate order.
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn filtered(&self) -> Vec<usize> {
+        let needle = self.filter.to_lowercase();
+        self.candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.to_string().to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
 /// In-memory dashboard state. Pure logic: no rendering and no `gh` calls.
 #[derive(Debug, Clone, PartialEq)]
 pub struct App {
@@ -15,6 +49,8 @@ pub struct App {
     pub fetched_at: Option<DateTime<Utc>>,
     pub refreshing: bool,
     pub errors: Vec<String>,
+    pub mode: Mode,
+    pub picker: Option<PickerState>,
 }
 
 impl App {
@@ -31,6 +67,8 @@ impl App {
             fetched_at,
             refreshing: false,
             errors: Vec::new(),
+            mode: Mode::Dashboard,
+            picker: None,
         };
         app.pick = app.compute_pick();
         app
@@ -103,6 +141,78 @@ impl App {
             Sort::Name => Sort::Last,
             Sort::Last => Sort::Momentum,
         };
+    }
+
+    /// Switches to the picker over `candidates`, seeding the pinned set
+    /// from `already_pinned`.
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn open_picker(&mut self, candidates: Vec<RepoRef>, already_pinned: &[RepoRef]) {
+        self.mode = Mode::Picker;
+        self.picker = Some(PickerState {
+            candidates,
+            pinned: already_pinned.iter().map(|r| r.to_string()).collect(),
+            filter: String::new(),
+            cursor: 0,
+        });
+    }
+
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn close_picker(&mut self) {
+        self.mode = Mode::Dashboard;
+        self.picker = None;
+    }
+
+    /// Moves the picker cursor by `delta`, clamped to the filtered list.
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn picker_move(&mut self, delta: i32) {
+        if let Some(p) = self.picker.as_mut() {
+            let len = p.filtered().len();
+            p.cursor = if len == 0 {
+                0
+            } else {
+                (p.cursor as i64 + i64::from(delta)).clamp(0, len as i64 - 1) as usize
+            };
+        }
+    }
+
+    /// Toggles the highlighted filtered candidate in the pinned set.
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn picker_toggle(&mut self) {
+        if let Some(p) = self.picker.as_mut() {
+            let filtered = p.filtered();
+            if let Some(&idx) = filtered.get(p.cursor) {
+                let key = p.candidates[idx].to_string();
+                if !p.pinned.remove(&key) {
+                    p.pinned.insert(key);
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn picker_filter_push(&mut self, c: char) {
+        if let Some(p) = self.picker.as_mut() {
+            p.filter.push(c);
+            p.cursor = 0;
+        }
+    }
+
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn picker_filter_pop(&mut self) {
+        if let Some(p) = self.picker.as_mut() {
+            p.filter.pop();
+            p.cursor = 0;
+        }
+    }
+
+    /// The pinned set as parsed `RepoRef`s, sorted by `owner/name`.
+    /// Unparsable entries are skipped.
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn picker_pins(&self) -> Vec<RepoRef> {
+        match &self.picker {
+            Some(p) => p.pinned.iter().filter_map(|s| RepoRef::parse(s)).collect(),
+            None => Vec::new(),
+        }
     }
 
     pub fn apply_refresh(&mut self, metrics: Vec<Metrics>, skipped: Vec<String>) {
@@ -296,5 +406,135 @@ mod tests {
         assert_eq!(app.sort, Sort::Last);
         app.cycle_sort();
         assert_eq!(app.sort, Sort::Momentum);
+    }
+
+    fn picker_app(candidates: &[&str], already: &[&str]) -> App {
+        let mut app = App::new(None, Sort::Momentum);
+        let cands = candidates
+            .iter()
+            .map(|s| RepoRef::parse(s).unwrap())
+            .collect();
+        let pins: Vec<RepoRef> = already.iter().map(|s| RepoRef::parse(s).unwrap()).collect();
+        app.open_picker(cands, &pins);
+        app
+    }
+
+    #[test]
+    fn open_picker_switches_mode_and_seeds_pins() {
+        let app = picker_app(&["octo/alpha", "octo/beta"], &["octo/beta"]);
+        assert_eq!(app.mode, Mode::Picker);
+        let p = app.picker.as_ref().unwrap();
+        assert_eq!(p.cursor, 0);
+        assert!(p.filter.is_empty());
+        assert!(p.pinned.contains("octo/beta"));
+        assert_eq!(p.pinned.len(), 1);
+    }
+
+    #[test]
+    fn close_picker_returns_to_dashboard() {
+        let mut app = picker_app(&["octo/alpha"], &[]);
+        app.close_picker();
+        assert_eq!(app.mode, Mode::Dashboard);
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn new_app_starts_in_dashboard_without_picker() {
+        let app = App::new(None, Sort::Momentum);
+        assert_eq!(app.mode, Mode::Dashboard);
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn filter_narrows_candidates_case_insensitively() {
+        let mut app = picker_app(&["octo/Alpha", "octo/beta", "other/gamma"], &[]);
+        for c in "ALP".chars() {
+            app.picker_filter_push(c);
+        }
+        let p = app.picker.as_ref().unwrap();
+        assert_eq!(p.filtered(), vec![0]);
+        assert_eq!(p.cursor, 0);
+        for _ in 0..3 {
+            app.picker_filter_pop();
+        }
+        assert_eq!(app.picker.as_ref().unwrap().filtered(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn filter_edit_resets_cursor() {
+        let mut app = picker_app(&["octo/a", "octo/b", "octo/c"], &[]);
+        app.picker_move(2);
+        assert_eq!(app.picker.as_ref().unwrap().cursor, 2);
+        app.picker_filter_push('b');
+        assert_eq!(app.picker.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn filter_pop_on_empty_filter_is_noop() {
+        let mut app = picker_app(&["octo/a"], &[]);
+        app.picker_filter_pop();
+        assert!(app.picker.as_ref().unwrap().filter.is_empty());
+    }
+
+    #[test]
+    fn toggle_adds_then_removes_highlighted_candidate() {
+        let mut app = picker_app(&["octo/alpha", "octo/beta"], &[]);
+        app.picker_move(1);
+        app.picker_toggle();
+        assert!(app.picker.as_ref().unwrap().pinned.contains("octo/beta"));
+        app.picker_toggle();
+        assert!(!app.picker.as_ref().unwrap().pinned.contains("octo/beta"));
+    }
+
+    #[test]
+    fn toggle_respects_filtered_cursor() {
+        let mut app = picker_app(&["octo/alpha", "octo/beta"], &[]);
+        app.picker_filter_push('b');
+        app.picker_toggle();
+        let p = app.picker.as_ref().unwrap();
+        assert!(p.pinned.contains("octo/beta"));
+        assert!(!p.pinned.contains("octo/alpha"));
+    }
+
+    #[test]
+    fn cursor_clamps_at_both_ends() {
+        let mut app = picker_app(&["octo/a", "octo/b", "octo/c"], &[]);
+        app.picker_move(10);
+        assert_eq!(app.picker.as_ref().unwrap().cursor, 2);
+        app.picker_move(-10);
+        assert_eq!(app.picker.as_ref().unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn cursor_and_toggle_are_safe_on_empty_filtered_list() {
+        let mut app = picker_app(&["octo/a"], &[]);
+        app.picker_filter_push('z');
+        app.picker_move(1);
+        app.picker_move(-1);
+        app.picker_toggle();
+        let p = app.picker.as_ref().unwrap();
+        assert_eq!(p.cursor, 0);
+        assert!(p.pinned.is_empty());
+    }
+
+    #[test]
+    fn picker_pins_reflects_toggles_sorted() {
+        let mut app = picker_app(&["octo/zeta", "octo/alpha"], &["octo/zeta"]);
+        app.picker_move(1);
+        app.picker_toggle();
+        let pins = app.picker_pins();
+        assert_eq!(
+            pins,
+            vec![
+                RepoRef::parse("octo/alpha").unwrap(),
+                RepoRef::parse("octo/zeta").unwrap()
+            ]
+        );
+        app.picker_move(-1);
+        app.picker_toggle();
+        assert_eq!(
+            app.picker_pins(),
+            vec![RepoRef::parse("octo/alpha").unwrap()]
+        );
     }
 }
