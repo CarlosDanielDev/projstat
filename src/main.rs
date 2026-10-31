@@ -1,3 +1,4 @@
+mod format;
 mod gh;
 mod metrics;
 mod model;
