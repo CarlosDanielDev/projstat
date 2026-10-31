@@ -1,4 +1,5 @@
 mod gh;
+mod metrics;
 mod model;
 
 fn main() {
