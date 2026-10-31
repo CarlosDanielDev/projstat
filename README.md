@@ -87,7 +87,7 @@ No config file yet? `projstat` opens to an empty dashboard and tells you how to 
 | `⏎` | Open the selected repo on GitHub |
 | `s` | Cycle sort |
 | `r` | Refresh now |
-| `q` | Quit |
+| `q` / `Esc` | Quit |
 
 ## Roadmap
 

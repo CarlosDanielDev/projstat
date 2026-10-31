@@ -7,6 +7,7 @@ mod metrics;
 mod model;
 mod ui;
 
+use std::future::Future;
 use std::io::{self, Stdout};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -44,6 +45,8 @@ const TICK: Duration = Duration::from_millis(100);
 struct Refresh {
     metrics: Vec<Metrics>,
     skipped: Vec<String>,
+    /// False when every pinned repo failed; the cache is then left untouched.
+    any_ok: bool,
 }
 
 #[tokio::main]
@@ -74,12 +77,17 @@ fn restore_terminal() {
 }
 
 /// Restores the terminal before the default panic message is printed, so the
-/// message is readable and the shell is not left in raw mode.
+/// message is readable and the shell is not left in raw mode. Only a panic on
+/// the main thread (the event loop) restores: a panic in a fetch task is
+/// reported as a skipped repo and must not tear down the live TUI.
 fn install_panic_restore() {
+    let main_thread = std::thread::current().id();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        default_hook(info);
+        if std::thread::current().id() == main_thread {
+            restore_terminal();
+            default_hook(info);
+        }
     }));
 }
 
@@ -140,8 +148,9 @@ fn handle_key(
     false
 }
 
-/// Spawns a bounded concurrent fetch of every pinned repo. Does nothing when
-/// a refresh is already in flight or there are no pins.
+/// Spawns a bounded refresh of every pinned repo and always sends exactly one
+/// `Refresh` back, even if fetches panic. Does nothing when a refresh is
+/// already in flight or there are no pins.
 fn start_refresh(app: &mut App, pinned: &[RepoRef], tx: &mpsc::UnboundedSender<Refresh>) {
     if app.refreshing || pinned.is_empty() {
         return;
@@ -153,36 +162,69 @@ fn start_refresh(app: &mut App, pinned: &[RepoRef], tx: &mpsc::UnboundedSender<R
     let previous = app.metrics.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let fetched: Vec<(RepoRef, anyhow::Result<Metrics>)> = futures::stream::iter(pinned)
-            .map(|repo| async move {
-                let result = gh::fetch_metrics(&repo).await;
-                (repo, result)
-            })
-            .buffer_unordered(FETCH_CONCURRENCY)
-            .collect()
-            .await;
-
-        let mut metrics = Vec::new();
-        let mut skipped = Vec::new();
-        for (repo, result) in fetched {
-            match result {
-                Ok(m) => metrics.push(m),
-                Err(e) => {
-                    skipped.push(format!("{repo}: {e:#}"));
-                    // Keep the last good snapshot so a failing repo does not vanish.
-                    if let Some(old) = previous.iter().find(|m| m.repo == repo) {
-                        metrics.push(old.clone());
-                    }
-                }
-            }
-        }
+        let refresh = collect_refresh(pinned, previous, |repo| async move {
+            gh::fetch_metrics(&repo).await
+        })
+        .await;
         // The receiver is gone only when the app is quitting; nothing to do then.
-        let _ = tx.send(Refresh { metrics, skipped });
+        let _ = tx.send(refresh);
     });
 }
 
-/// Applies a finished refresh and persists the new snapshot.
+/// Fetches every repo with bounded concurrency. Each fetch runs in its own
+/// task, so a panic becomes a `JoinError` for that repo only. A failed repo
+/// keeps its previous metrics so it does not vanish from the dashboard.
+async fn collect_refresh<F, Fut>(pinned: Vec<RepoRef>, previous: Vec<Metrics>, fetch: F) -> Refresh
+where
+    F: Fn(RepoRef) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = anyhow::Result<Metrics>> + Send + 'static,
+{
+    let fetched: Vec<(RepoRef, anyhow::Result<Metrics>)> = futures::stream::iter(pinned)
+        .map(|repo| {
+            let fetch = fetch.clone();
+            async move {
+                let worker = tokio::spawn(fetch(repo.clone()));
+                let result = match worker.await {
+                    Ok(result) => result,
+                    Err(e) => Err(anyhow::anyhow!("fetch task failed: {e}")),
+                };
+                (repo, result)
+            }
+        })
+        .buffer_unordered(FETCH_CONCURRENCY)
+        .collect()
+        .await;
+
+    let any_ok = fetched.iter().any(|(_, result)| result.is_ok());
+    let mut metrics = Vec::new();
+    let mut skipped = Vec::new();
+    for (repo, result) in fetched {
+        match result {
+            Ok(m) => metrics.push(m),
+            Err(e) => {
+                skipped.push(format!("{repo}: {e:#}"));
+                if let Some(old) = previous.iter().find(|m| m.repo == repo) {
+                    metrics.push(old.clone());
+                }
+            }
+        }
+    }
+    Refresh {
+        metrics,
+        skipped,
+        any_ok,
+    }
+}
+
+/// Applies a finished refresh. A refresh where every fetch failed only clears
+/// the in-flight flag and records the errors: the cached data keeps its
+/// original `fetched_at` and is not rewritten.
 fn finish_refresh(app: &mut App, done: Refresh) {
+    if !done.any_ok {
+        app.refreshing = false;
+        app.errors.extend(done.skipped);
+        return;
+    }
     app.apply_refresh(done.metrics, done.skipped);
     if let Some(fetched_at) = app.fetched_at {
         let snapshot = Cache {
@@ -214,4 +256,88 @@ fn open_selected(app: &App) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn repo(name: &str) -> RepoRef {
+        RepoRef::parse(&format!("octo/{name}")).unwrap()
+    }
+
+    fn metric(repo: RepoRef, closed: u32) -> Metrics {
+        Metrics {
+            repo,
+            next_milestone: None,
+            open_issues: 0,
+            closed_7d: closed,
+            opened_7d: 0,
+            last_activity: Utc.with_ymd_and_hms(2026, 10, 30, 0, 0, 0).unwrap(),
+            releases_shipped: 0,
+        }
+    }
+
+    /// Good repo succeeds, `bad` returns an error, `boom` panics.
+    async fn fake_fetch(r: RepoRef) -> anyhow::Result<Metrics> {
+        match r.name.as_str() {
+            "good" => Ok(metric(r, 3)),
+            "bad" => anyhow::bail!("404 not found"),
+            _ => panic!("simulated fetch panic"),
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_fetch_still_delivers_a_refresh() {
+        let pinned = vec![repo("good"), repo("bad"), repo("boom")];
+        let previous = vec![metric(repo("boom"), 9)];
+        let refresh = collect_refresh(pinned, previous, fake_fetch).await;
+
+        assert!(refresh.any_ok);
+        assert_eq!(refresh.metrics.len(), 2);
+        assert!(refresh.metrics.iter().any(|m| m.repo == repo("good")));
+        // The panicking repo falls back to its previous snapshot.
+        assert!(refresh.metrics.iter().any(|m| m.closed_7d == 9));
+        assert_eq!(refresh.skipped.len(), 2);
+        assert!(
+            refresh
+                .skipped
+                .iter()
+                .any(|s| s.contains("fetch task failed"))
+        );
+        assert!(refresh.skipped.iter().any(|s| s.contains("404 not found")));
+    }
+
+    #[tokio::test]
+    async fn refreshing_clears_after_panicking_refresh() {
+        let mut app = App::new(None, crate::config::Sort::Momentum);
+        app.refreshing = true;
+        let refresh = collect_refresh(vec![repo("boom")], vec![], fake_fetch).await;
+        finish_refresh(&mut app, refresh);
+
+        assert!(!app.refreshing);
+        assert!(app.fetched_at.is_none());
+        assert!(app.errors.iter().any(|e| e.contains("fetch task failed")));
+    }
+
+    #[tokio::test]
+    async fn all_failed_refresh_keeps_cached_timestamp() {
+        let cached = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let mut app = App::new(
+            Some(crate::cache::Cache {
+                fetched_at: cached,
+                metrics: vec![metric(repo("bad"), 1)],
+            }),
+            crate::config::Sort::Momentum,
+        );
+        app.refreshing = true;
+        let refresh = collect_refresh(vec![repo("bad")], app.metrics.clone(), fake_fetch).await;
+        assert!(!refresh.any_ok);
+        finish_refresh(&mut app, refresh);
+
+        assert!(!app.refreshing);
+        assert_eq!(app.fetched_at, Some(cached));
+        assert_eq!(app.metrics.len(), 1);
+    }
 }
