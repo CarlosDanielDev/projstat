@@ -53,6 +53,20 @@ fn title_bar(app: &App) -> Paragraph<'static> {
         Span::styled("projstat", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!("  ·  {}", Local::now().format("%d %b"))),
     ];
+    let age = match app.fetched_at {
+        Some(t) => format!(
+            "updated {} ago",
+            humanize_age((Utc::now() - t).num_seconds())
+        ),
+        None => "never updated".to_string(),
+    };
+    spans.push(Span::raw(format!("  ·  {age}")));
+    if !app.errors.is_empty() {
+        spans.push(Span::styled(
+            format!("  ·  ⚠ {}", app.errors.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
     if app.refreshing {
         spans.push(Span::raw("  ·  refreshing…"));
     }
@@ -217,6 +231,26 @@ mod tests {
         assert!(text.contains("TODAY'S PICK"), "missing hero label:\n{text}");
         assert!(text.contains("my-project"), "missing repo name:\n{text}");
         assert!(text.contains("q quit"), "missing keybind footer:\n{text}");
+    }
+
+    #[test]
+    fn title_shows_age_and_error_count() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let mut app = fixture_app();
+        app.fetched_at = Some(Utc::now() - Duration::hours(3));
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("updated 3h ago"), "missing age:\n{text}");
+        assert!(!text.contains('⚠'), "unexpected error indicator:\n{text}");
+
+        app.errors = vec!["a failed".into(), "b failed".into()];
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("⚠ 2"), "missing error count:\n{text}");
+
+        app.fetched_at = None;
+        terminal.draw(|f| render(f, &app)).unwrap();
+        assert!(buffer_text(&terminal).contains("never updated"));
     }
 
     fn named_metric(name: &str, open: u32, closed_7d: u32) -> Metrics {
