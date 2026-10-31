@@ -19,7 +19,6 @@ pub enum Sort {
 
 impl Sort {
     /// The lowercase word used for this order in the config file.
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn as_str(self) -> &'static str {
         match self {
             Sort::Momentum => "momentum",
@@ -63,7 +62,6 @@ struct RawConfig {
 
 /// On-disk shape used for writing; mirrors `RawConfig` with plain strings.
 #[derive(Serialize)]
-#[allow(dead_code)] // unused until the picker UI lands (task B)
 struct RawConfigOut {
     pinned: Vec<String>,
     sort: &'static str,
@@ -71,7 +69,6 @@ struct RawConfigOut {
 }
 
 /// Serializes config to TOML in the same shape `parse_config` reads.
-#[allow(dead_code)] // unused until the picker UI lands (task B)
 pub fn to_toml_string(config: &Config) -> Result<String> {
     let out = RawConfigOut {
         pinned: config.pinned.iter().map(|r| r.to_string()).collect(),
@@ -82,7 +79,6 @@ pub fn to_toml_string(config: &Config) -> Result<String> {
 }
 
 /// Writes config to `config_path()`, creating parent directories.
-#[allow(dead_code)] // unused until the picker UI lands (task B)
 pub fn save(config: &Config) -> Result<()> {
     let path = config_path();
     if let Some(parent) = path.parent() {

@@ -7,7 +7,6 @@ use crate::model::{Metrics, RepoRef};
 
 /// Which screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(dead_code)] // unused until the picker UI lands (task B)
 pub enum Mode {
     #[default]
     Dashboard,
@@ -16,7 +15,6 @@ pub enum Mode {
 
 /// State of the in-TUI pin picker. `pinned` holds `owner/name` strings.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // unused until the picker UI lands (task B)
 pub struct PickerState {
     pub candidates: Vec<RepoRef>,
     pub pinned: std::collections::BTreeSet<String>,
@@ -27,7 +25,6 @@ pub struct PickerState {
 impl PickerState {
     /// Indices into `candidates` whose display string contains `filter`
     /// (case-insensitive), in candidate order.
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn filtered(&self) -> Vec<usize> {
         let needle = self.filter.to_lowercase();
         self.candidates
@@ -145,7 +142,6 @@ impl App {
 
     /// Switches to the picker over `candidates`, seeding the pinned set
     /// from `already_pinned`.
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn open_picker(&mut self, candidates: Vec<RepoRef>, already_pinned: &[RepoRef]) {
         self.mode = Mode::Picker;
         self.picker = Some(PickerState {
@@ -156,14 +152,12 @@ impl App {
         });
     }
 
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn close_picker(&mut self) {
         self.mode = Mode::Dashboard;
         self.picker = None;
     }
 
     /// Moves the picker cursor by `delta`, clamped to the filtered list.
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn picker_move(&mut self, delta: i32) {
         if let Some(p) = self.picker.as_mut() {
             let len = p.filtered().len();
@@ -176,7 +170,6 @@ impl App {
     }
 
     /// Toggles the highlighted filtered candidate in the pinned set.
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn picker_toggle(&mut self) {
         if let Some(p) = self.picker.as_mut() {
             let filtered = p.filtered();
@@ -189,7 +182,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn picker_filter_push(&mut self, c: char) {
         if let Some(p) = self.picker.as_mut() {
             p.filter.push(c);
@@ -197,7 +189,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn picker_filter_pop(&mut self) {
         if let Some(p) = self.picker.as_mut() {
             p.filter.pop();
@@ -207,7 +198,6 @@ impl App {
 
     /// The pinned set as parsed `RepoRef`s, sorted by `owner/name`.
     /// Unparsable entries are skipped.
-    #[allow(dead_code)] // unused until the picker UI lands (task B)
     pub fn picker_pins(&self) -> Vec<RepoRef> {
         match &self.picker {
             Some(p) => p.pinned.iter().filter_map(|s| RepoRef::parse(s)).collect(),

@@ -206,8 +206,6 @@ fn repo_list_args(org: Option<&str>) -> Vec<String> {
 
 /// Lists repositories for each org plus the authed user, de-duplicated in
 /// first-seen order.
-// Not wired into the MVP event loop yet (discovery picker is post-v0.1); kept and tested.
-#[allow(dead_code)]
 pub async fn discover_repos(orgs: &[String]) -> anyhow::Result<Vec<RepoRef>> {
     let mut found = Vec::new();
     for org in orgs {

@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 
 use app::App;
 use cache::Cache;
+use config::Config;
 use model::{Metrics, RepoRef};
 
 /// Terminal dashboard for your pinned GitHub projects. Configure pins in
@@ -49,6 +50,12 @@ struct Refresh {
     any_ok: bool,
 }
 
+/// Everything a background task sends back to the event loop.
+enum Msg {
+    Refresh(Refresh),
+    Discovered(anyhow::Result<Vec<RepoRef>>),
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     Args::parse();
@@ -58,12 +65,12 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("projstat: {e:#}");
         std::process::exit(1);
     }
-    let config = config::load();
+    let mut config = config::load();
     let mut app = App::new(cache::load(), config.sort);
 
     install_panic_restore();
     let mut terminal = enter_terminal()?;
-    let result = run(&mut terminal, &mut app, &config.pinned).await;
+    let result = run(&mut terminal, &mut app, &mut config).await;
     // Normal exit and error exit both land here; panics are covered by the hook.
     restore_terminal();
     result
@@ -106,22 +113,45 @@ fn enter_terminal() -> anyhow::Result<Term> {
     }
 }
 
-async fn run(terminal: &mut Term, app: &mut App, pinned: &[RepoRef]) -> anyhow::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Refresh>();
+/// Loop-local state that is not part of the rendered `App`.
+#[derive(Default)]
+struct Flags {
+    /// Repo discovery is in flight; a second `a` press is ignored.
+    discovering: bool,
+    /// Pins were saved while a refresh was running; refresh once it finishes.
+    refresh_pending: bool,
+}
+
+async fn run(terminal: &mut Term, app: &mut App, config: &mut Config) -> anyhow::Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    let mut flags = Flags::default();
     // Cached metrics render first; this refresh then updates them in place.
-    start_refresh(app, pinned, &tx);
+    start_refresh(app, &config.pinned, &tx);
 
     loop {
         terminal.draw(|f| ui::render(f, app))?;
 
-        while let Ok(done) = rx.try_recv() {
-            finish_refresh(app, done);
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                Msg::Refresh(done) => finish_refresh(app, done),
+                Msg::Discovered(result) => {
+                    flags.discovering = false;
+                    match result {
+                        Ok(candidates) => app.open_picker(candidates, &config.pinned),
+                        Err(e) => app.errors.push(format!("discovery failed: {e:#}")),
+                    }
+                }
+            }
+        }
+        if flags.refresh_pending && !app.refreshing {
+            flags.refresh_pending = false;
+            start_refresh(app, &config.pinned, &tx);
         }
 
         if event::poll(TICK)?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && handle_key(app, key, pinned, &tx)
+            && handle_key(app, key, config, &mut flags, &tx)
         {
             return Ok(());
         }
@@ -132,26 +162,111 @@ async fn run(terminal: &mut Term, app: &mut App, pinned: &[RepoRef]) -> anyhow::
 fn handle_key(
     app: &mut App,
     key: KeyEvent,
-    pinned: &[RepoRef],
-    tx: &mpsc::UnboundedSender<Refresh>,
+    config: &mut Config,
+    flags: &mut Flags,
+    tx: &mpsc::UnboundedSender<Msg>,
 ) -> bool {
+    if app.mode == app::Mode::Picker {
+        return handle_picker_key(app, key, config, flags, tx);
+    }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Up | KeyCode::Char('k') => app.select_prev(),
         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
         KeyCode::Char('s') => app.cycle_sort(),
-        KeyCode::Char('r') => start_refresh(app, pinned, tx),
+        KeyCode::Char('r') => start_refresh(app, &config.pinned, tx),
+        KeyCode::Char('a') if !flags.discovering => {
+            flags.discovering = true;
+            start_discovery(&config.discover_orgs, tx);
+        }
         KeyCode::Enter => open_selected(app),
         _ => {}
     }
     false
 }
 
+/// Applies one key press while the pin picker is open. Only Esc leaves the
+/// picker; `q` is an ordinary filter character here. Returns `true` only for
+/// Ctrl-C, which quits from anywhere.
+fn handle_picker_key(
+    app: &mut App,
+    key: KeyEvent,
+    config: &mut Config,
+    flags: &mut Flags,
+    tx: &mpsc::UnboundedSender<Msg>,
+) -> bool {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Esc => app.close_picker(),
+        KeyCode::Enter => save_picker(app, config, flags, tx),
+        KeyCode::Up => app.picker_move(-1),
+        KeyCode::Down => app.picker_move(1),
+        KeyCode::Backspace => app.picker_filter_pop(),
+        KeyCode::Char(' ') => app.picker_toggle(),
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.picker_filter_push(c);
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Persists the picker's pins, makes them the active set, closes the picker
+/// and refreshes over the new pins. A save failure is reported in the errors
+/// list but the new pins still apply for this session.
+fn save_picker(
+    app: &mut App,
+    config: &mut Config,
+    flags: &mut Flags,
+    tx: &mpsc::UnboundedSender<Msg>,
+) {
+    let pins = app.picker_pins();
+    let saved = Config {
+        pinned: pins.clone(),
+        sort: app.sort,
+        discover_orgs: config.discover_orgs.clone(),
+    };
+    let save_result = config::save(&saved);
+    config.pinned = pins;
+    app.close_picker();
+
+    if app.refreshing {
+        // The in-flight refresh fetched the old pins; the loop starts a new one.
+        flags.refresh_pending = true;
+    } else {
+        start_refresh(app, &config.pinned, tx);
+    }
+    // Pushed after the refresh starts, which clears the error list.
+    // While a refresh is in flight it is cleared again when the queued one starts.
+    if let Err(e) = save_result {
+        app.errors.push(format!("config not saved: {e:#}"));
+    }
+}
+
+/// Runs repo discovery in the background and sends the outcome back. A panic
+/// inside discovery becomes an `Err`, so the event loop always gets one reply.
+fn start_discovery(discover_orgs: &[String], tx: &mpsc::UnboundedSender<Msg>) {
+    let orgs = discover_orgs.to_vec();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let worker = tokio::spawn(async move { gh::discover_repos(&orgs).await });
+        let result = match worker.await {
+            Ok(result) => result,
+            Err(e) => Err(anyhow::anyhow!("discovery task failed: {e}")),
+        };
+        let _ = tx.send(Msg::Discovered(result));
+    });
+}
+
 /// Spawns a bounded refresh of every pinned repo and always sends exactly one
 /// `Refresh` back, even if fetches panic. Does nothing when a refresh is
 /// already in flight or there are no pins.
-fn start_refresh(app: &mut App, pinned: &[RepoRef], tx: &mpsc::UnboundedSender<Refresh>) {
+fn start_refresh(app: &mut App, pinned: &[RepoRef], tx: &mpsc::UnboundedSender<Msg>) {
     if app.refreshing || pinned.is_empty() {
         return;
     }
@@ -167,7 +282,7 @@ fn start_refresh(app: &mut App, pinned: &[RepoRef], tx: &mpsc::UnboundedSender<R
         })
         .await;
         // The receiver is gone only when the app is quitting; nothing to do then.
-        let _ = tx.send(refresh);
+        let _ = tx.send(Msg::Refresh(refresh));
     });
 }
 
@@ -286,6 +401,54 @@ mod tests {
             "bad" => anyhow::bail!("404 not found"),
             _ => panic!("simulated fetch panic"),
         }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn picker_keeps_q_as_filter_text_and_only_esc_leaves() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(None, crate::config::Sort::Momentum);
+        let mut config = Config::default();
+        let mut flags = Flags::default();
+        app.open_picker(vec![repo("alpha")], &[]);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Char('q')),
+            &mut config,
+            &mut flags,
+            &tx
+        ));
+        assert_eq!(app.picker.as_ref().unwrap().filter, "q");
+        assert_eq!(app.mode, app::Mode::Picker);
+
+        assert!(!handle_key(
+            &mut app,
+            key(KeyCode::Esc),
+            &mut config,
+            &mut flags,
+            &tx
+        ));
+        assert_eq!(app.mode, app::Mode::Dashboard);
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn dashboard_q_quits() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(None, crate::config::Sort::Momentum);
+        let mut config = Config::default();
+        let mut flags = Flags::default();
+        assert!(handle_key(
+            &mut app,
+            key(KeyCode::Char('q')),
+            &mut config,
+            &mut flags,
+            &tx
+        ));
     }
 
     #[tokio::test]
