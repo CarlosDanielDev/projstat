@@ -66,7 +66,13 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     let mut config = config::load();
-    let mut app = App::new(cache::load(), config.sort);
+    // Cached rows for repos that are no longer pinned would reappear on restart.
+    let cache = if config.pinned.is_empty() {
+        None
+    } else {
+        cache::load()
+    };
+    let mut app = App::new(cache, config.sort);
 
     install_panic_restore();
     let mut terminal = enter_terminal()?;
@@ -120,6 +126,8 @@ struct Flags {
     discovering: bool,
     /// Pins were saved while a refresh was running; refresh once it finishes.
     refresh_pending: bool,
+    /// Config save failure to show once the queued refresh has cleared the errors.
+    pending_save_error: Option<String>,
 }
 
 async fn run(terminal: &mut Term, app: &mut App, config: &mut Config) -> anyhow::Result<()> {
@@ -133,6 +141,8 @@ async fn run(terminal: &mut Term, app: &mut App, config: &mut Config) -> anyhow:
 
         while let Ok(msg) = rx.try_recv() {
             match msg {
+                // Pins were emptied while this refresh ran: its rows are stale.
+                Msg::Refresh(_) if config.pinned.is_empty() => app.refreshing = false,
                 Msg::Refresh(done) => finish_refresh(app, done),
                 Msg::Discovered(result) => {
                     flags.discovering = false;
@@ -143,9 +153,8 @@ async fn run(terminal: &mut Term, app: &mut App, config: &mut Config) -> anyhow:
                 }
             }
         }
-        if flags.refresh_pending && !app.refreshing {
-            flags.refresh_pending = false;
-            start_refresh(app, &config.pinned, &tx);
+        if begin_queued_refresh(app, &mut flags, &config.pinned) {
+            spawn_refresh(app, &config.pinned, &tx);
         }
 
         if event::poll(TICK)?
@@ -199,7 +208,7 @@ fn handle_picker_key(
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Esc => app.close_picker(),
-        KeyCode::Enter => save_picker(app, config, flags, tx),
+        KeyCode::Enter => save_picker(app, config, flags, tx, config::save),
         KeyCode::Up => app.picker_move(-1),
         KeyCode::Down => app.picker_move(1),
         KeyCode::Backspace => app.picker_filter_pop(),
@@ -217,13 +226,15 @@ fn handle_picker_key(
 }
 
 /// Persists the picker's pins, makes them the active set, closes the picker
-/// and refreshes over the new pins. A save failure is reported in the errors
-/// list but the new pins still apply for this session.
+/// and refreshes over the new pins. `save` is injected so tests never touch
+/// the real config file. A save failure is shown after the queued refresh
+/// and the new pins still apply for this session.
 fn save_picker(
     app: &mut App,
     config: &mut Config,
     flags: &mut Flags,
     tx: &mpsc::UnboundedSender<Msg>,
+    save: impl FnOnce(&Config) -> anyhow::Result<()>,
 ) {
     let pins = app.picker_pins();
     let saved = Config {
@@ -231,21 +242,36 @@ fn save_picker(
         sort: app.sort,
         discover_orgs: config.discover_orgs.clone(),
     };
-    let save_result = config::save(&saved);
+    flags.pending_save_error = match save(&saved) {
+        Ok(()) => None,
+        Err(e) => Some(format!("config not saved: {e:#}")),
+    };
     config.pinned = pins;
     app.close_picker();
+    if config.pinned.is_empty() {
+        // No pins means no refresh will run, so drop the old rows now.
+        app.clear_metrics();
+    }
+    flags.refresh_pending = true;
+    // While a refresh is in flight, the loop starts the queued one when it ends.
+    if !app.refreshing && begin_queued_refresh(app, flags, &config.pinned) {
+        spawn_refresh(app, &config.pinned, tx);
+    }
+}
 
-    if app.refreshing {
-        // The in-flight refresh fetched the old pins; the loop starts a new one.
-        flags.refresh_pending = true;
-    } else {
-        start_refresh(app, &config.pinned, tx);
+/// Starts the refresh queued by a save. Returns true when the caller must
+/// call `spawn_refresh`. A save error on the queue is pushed after
+/// `begin_refresh` clears the error list, so it stays visible.
+fn begin_queued_refresh(app: &mut App, flags: &mut Flags, pinned: &[RepoRef]) -> bool {
+    if !flags.refresh_pending || app.refreshing {
+        return false;
     }
-    // Pushed after the refresh starts, which clears the error list.
-    // While a refresh is in flight it is cleared again when the queued one starts.
-    if let Err(e) = save_result {
-        app.errors.push(format!("config not saved: {e:#}"));
+    flags.refresh_pending = false;
+    let started = begin_refresh(app, pinned);
+    if let Some(e) = flags.pending_save_error.take() {
+        app.errors.push(e);
     }
+    started
 }
 
 /// Runs repo discovery in the background and sends the outcome back. A panic
@@ -267,12 +293,24 @@ fn start_discovery(discover_orgs: &[String], tx: &mpsc::UnboundedSender<Msg>) {
 /// `Refresh` back, even if fetches panic. Does nothing when a refresh is
 /// already in flight or there are no pins.
 fn start_refresh(app: &mut App, pinned: &[RepoRef], tx: &mpsc::UnboundedSender<Msg>) {
+    if begin_refresh(app, pinned) {
+        spawn_refresh(app, pinned, tx);
+    }
+}
+
+/// Marks a refresh as in flight and clears the previous errors. Returns false,
+/// changing nothing, when one is already running or there are no pins.
+fn begin_refresh(app: &mut App, pinned: &[RepoRef]) -> bool {
     if app.refreshing || pinned.is_empty() {
-        return;
+        return false;
     }
     app.refreshing = true;
     app.errors.clear();
+    true
+}
 
+/// Spawns the fetches for a refresh that `begin_refresh` accepted.
+fn spawn_refresh(app: &App, pinned: &[RepoRef], tx: &mpsc::UnboundedSender<Msg>) {
     let pinned = pinned.to_vec();
     let previous = app.metrics.clone();
     let tx = tx.clone();
@@ -401,6 +439,71 @@ mod tests {
             "bad" => anyhow::bail!("404 not found"),
             _ => panic!("simulated fetch panic"),
         }
+    }
+
+    fn disk_full(_: &Config) -> anyhow::Result<()> {
+        anyhow::bail!("disk full")
+    }
+
+    #[test]
+    fn save_error_stays_visible_when_queued_refresh_starts() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(None, crate::config::Sort::Momentum);
+        let mut config = Config {
+            pinned: vec![repo("alpha")],
+            ..Config::default()
+        };
+        let mut flags = Flags::default();
+        app.open_picker(vec![repo("alpha"), repo("beta")], &config.pinned);
+        app.picker_move(1);
+        app.picker_toggle();
+        // A refresh is still running with the old pins when Enter is pressed.
+        app.refreshing = true;
+        app.errors.push("earlier refresh error".into());
+
+        save_picker(&mut app, &mut config, &mut flags, &tx, disk_full);
+        assert!(flags.refresh_pending);
+
+        // The in-flight refresh ends, then the queued one starts.
+        app.refreshing = false;
+        assert!(begin_queued_refresh(&mut app, &mut flags, &config.pinned));
+        assert!(
+            app.errors
+                .iter()
+                .any(|e| e.contains("config not saved") && e.contains("disk full")),
+            "save error was cleared: {:?}",
+            app.errors
+        );
+        assert!(!app.errors.iter().any(|e| e == "earlier refresh error"));
+    }
+
+    #[test]
+    fn unpinning_everything_clears_rows_and_pick() {
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(None, crate::config::Sort::Momentum);
+        let mut config = Config {
+            pinned: vec![repo("alpha"), repo("beta")],
+            ..Config::default()
+        };
+        let mut flags = Flags::default();
+        app.apply_refresh(
+            vec![metric(repo("alpha"), 1), metric(repo("beta"), 1)],
+            vec![],
+        );
+        assert!(app.pick.is_some());
+        app.open_picker(vec![repo("alpha"), repo("beta")], &config.pinned);
+        app.picker_toggle();
+        app.picker_move(1);
+        app.picker_toggle();
+
+        save_picker(&mut app, &mut config, &mut flags, &tx, |_| Ok(()));
+
+        assert!(config.pinned.is_empty());
+        assert!(app.metrics.is_empty(), "stale rows: {:?}", app.metrics);
+        assert!(app.pick.is_none());
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.mode, app::Mode::Dashboard);
+        assert!(app.errors.is_empty());
     }
 
     fn key(code: KeyCode) -> KeyEvent {

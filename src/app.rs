@@ -205,6 +205,13 @@ impl App {
         }
     }
 
+    /// Drops all rows, for when the pin set is emptied and no refresh will run.
+    pub fn clear_metrics(&mut self) {
+        self.metrics.clear();
+        self.pick = self.compute_pick();
+        self.selected = 0;
+    }
+
     pub fn apply_refresh(&mut self, metrics: Vec<Metrics>, skipped: Vec<String>) {
         self.metrics = metrics;
         self.fetched_at = Some(Utc::now());
