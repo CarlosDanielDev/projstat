@@ -132,6 +132,22 @@ fn since_date(now: DateTime<Utc>) -> String {
     (now - TimeDelta::days(7)).format("%Y-%m-%d").to_string()
 }
 
+fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s.trim())
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// Most recent of `pushed_at` and the latest issue/PR update. Either may be
+/// absent (`null`/empty); both absent is an error.
+fn latest_activity(pushed: &str, issue_updated: &str) -> anyhow::Result<DateTime<Utc>> {
+    parse_ts(pushed)
+        .into_iter()
+        .chain(parse_ts(issue_updated))
+        .max()
+        .context("repo has neither pushed_at nor issue/PR activity")
+}
+
 /// Fetches the activity metrics for one repository. Any failing `gh` call
 /// fails the whole fetch.
 pub async fn fetch_metrics(repo: &RepoRef) -> anyhow::Result<Metrics> {
@@ -143,14 +159,18 @@ pub async fn fetch_metrics(repo: &RepoRef) -> anyhow::Result<Metrics> {
     let opened_path = format!("search/issues?q=repo:{slug}+type:issue+created:>={since}");
     let releases_path = format!("repos/{slug}/releases?per_page=100");
     let repo_path = format!("repos/{slug}");
-    let (milestones_json, open_json, closed_json, opened_json, releases, pushed) = tokio::try_join!(
+    let issues_path =
+        format!("repos/{slug}/issues?state=all&sort=updated&direction=desc&per_page=1");
+    let (milestones_json, open_json, closed_json, opened_json, releases, pushed, issue_updated) = tokio::try_join!(
         gh_api(&milestones_path, None),
         gh_api(&open_path, None),
         gh_api(&closed_path, None),
         gh_api(&opened_path, None),
         gh_api(&releases_path, Some("length")),
         gh_api(&repo_path, Some(".pushed_at")),
+        gh_api(&issues_path, Some(".[0].updated_at // empty")),
     )?;
+    let last_activity = latest_activity(&pushed, &issue_updated)?;
 
     let milestones = parse_milestones(&milestones_json)?;
     let (closed_7d, opened_7d) = parse_issue_counts(&closed_json, &opened_json)?;
@@ -160,9 +180,7 @@ pub async fn fetch_metrics(repo: &RepoRef) -> anyhow::Result<Metrics> {
         open_issues: parse_total(&open_json)?,
         closed_7d,
         opened_7d,
-        last_activity: DateTime::parse_from_rfc3339(pushed.trim())
-            .context("parsing pushed_at")?
-            .with_timezone(&Utc),
+        last_activity,
         releases_shipped: releases
             .trim()
             .parse::<u32>()
@@ -278,6 +296,20 @@ mod tests {
     #[test]
     fn parse_issue_counts_bad_input_is_err() {
         assert!(parse_issue_counts("", "{").is_err());
+    }
+
+    #[test]
+    fn latest_activity_takes_max_and_tolerates_missing() {
+        let push = "2026-10-01T00:00:00Z";
+        let iss = "2026-10-20T00:00:00Z";
+        assert_eq!(latest_activity(push, iss).unwrap(), parse_ts(iss).unwrap());
+        assert_eq!(latest_activity(iss, push).unwrap(), parse_ts(iss).unwrap());
+        assert_eq!(latest_activity(push, "").unwrap(), parse_ts(push).unwrap());
+        assert_eq!(
+            latest_activity("null", iss).unwrap(),
+            parse_ts(iss).unwrap()
+        );
+        assert!(latest_activity("null", "").is_err());
     }
 
     #[test]
