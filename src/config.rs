@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Result, anyhow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::RepoRef;
 
@@ -15,6 +15,19 @@ pub enum Sort {
     Progress,
     Name,
     Last,
+}
+
+impl Sort {
+    /// The lowercase word used for this order in the config file.
+    #[allow(dead_code)] // unused until the picker UI lands (task B)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sort::Momentum => "momentum",
+            Sort::Progress => "progress",
+            Sort::Name => "name",
+            Sort::Last => "last",
+        }
+    }
 }
 
 impl FromStr for Sort {
@@ -46,6 +59,37 @@ struct RawConfig {
     pinned: Vec<String>,
     sort: Option<String>,
     discover_orgs: Vec<String>,
+}
+
+/// On-disk shape used for writing; mirrors `RawConfig` with plain strings.
+#[derive(Serialize)]
+#[allow(dead_code)] // unused until the picker UI lands (task B)
+struct RawConfigOut {
+    pinned: Vec<String>,
+    sort: &'static str,
+    discover_orgs: Vec<String>,
+}
+
+/// Serializes config to TOML in the same shape `parse_config` reads.
+#[allow(dead_code)] // unused until the picker UI lands (task B)
+pub fn to_toml_string(config: &Config) -> Result<String> {
+    let out = RawConfigOut {
+        pinned: config.pinned.iter().map(|r| r.to_string()).collect(),
+        sort: config.sort.as_str(),
+        discover_orgs: config.discover_orgs.clone(),
+    };
+    Ok(toml::to_string(&out)?)
+}
+
+/// Writes config to `config_path()`, creating parent directories.
+#[allow(dead_code)] // unused until the picker UI lands (task B)
+pub fn save(config: &Config) -> Result<()> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, to_toml_string(config)?)?;
+    Ok(())
 }
 
 /// Parses config TOML. Empty input yields `Config::default()`.
@@ -139,6 +183,28 @@ discover_orgs = ["hawk-oliver"]
     fn sort_parses_case_insensitively() {
         assert_eq!("Name".parse::<Sort>().unwrap(), Sort::Name);
         assert_eq!("LAST".parse::<Sort>().unwrap(), Sort::Last);
+    }
+
+    #[test]
+    fn to_toml_round_trips_through_parse_config() {
+        let cfg = Config {
+            pinned: vec![
+                RepoRef::parse("octo/alpha").unwrap(),
+                RepoRef::parse("octo/beta").unwrap(),
+            ],
+            sort: Sort::Last,
+            discover_orgs: vec!["hawk-oliver".to_string()],
+        };
+        let text = to_toml_string(&cfg).expect("serializes");
+        assert!(
+            text.contains("\"octo/alpha\""),
+            "pins are owner/name strings: {text}"
+        );
+        assert!(
+            text.contains("sort = \"last\""),
+            "sort is lowercase word: {text}"
+        );
+        assert_eq!(parse_config(&text).expect("re-parses"), cfg);
     }
 
     #[test]
