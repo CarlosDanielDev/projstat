@@ -3,7 +3,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Cell, Paragraph, Row, Table, TableState};
 
 use crate::app::App;
 use crate::format::{humanize_age, progress_bar};
@@ -12,21 +12,40 @@ use crate::model::{Liveness, Metrics};
 
 /// Draws the whole dashboard into `f`. Diff-only rendering: no clears, no stdout.
 pub fn render(f: &mut Frame, app: &App) {
-    let [title_area, hero_area, table_area, footer_area] = Layout::vertical([
+    let [title_area, hero_area, table_area, summary_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(5),
         Constraint::Min(3),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .areas(f.area());
 
     f.render_widget(title_bar(app), title_area);
     f.render_widget(hero(app), hero_area);
-    f.render_widget(project_table(app), table_area);
+    // Stateful so ratatui scrolls the selected row into view.
+    let mut table_state =
+        TableState::new().with_selected((!app.metrics.is_empty()).then_some(app.selected));
+    f.render_stateful_widget(project_table(app), table_area, &mut table_state);
+    f.render_widget(Paragraph::new(summary(app)), summary_area);
     f.render_widget(
         Paragraph::new("↑↓ move   ⏎ open repo   s sort   r refresh   q quit"),
         footer_area,
     );
+}
+
+/// One-line totals across all tracked repos.
+fn summary(app: &App) -> String {
+    let open: u32 = app.metrics.iter().map(|m| m.open_issues).sum();
+    let closed: u32 = app.metrics.iter().map(|m| m.closed_7d).sum();
+    let releases: u32 = app.metrics.iter().map(|m| m.releases_shipped).sum();
+    format!(
+        "{} repos · {} open issues · {} closed this week · {} releases shipped",
+        app.metrics.len(),
+        open,
+        closed,
+        releases
+    )
 }
 
 fn title_bar(app: &App) -> Paragraph<'static> {
@@ -81,18 +100,14 @@ fn project_table(app: &App) -> Table<'static> {
     .style(Style::default().add_modifier(Modifier::BOLD));
 
     let now = Utc::now();
+    // Rows follow sorted_indices(); the highlight is applied by the TableState
+    // selection (an ordinal position), not by styling rows here.
     let rows: Vec<Row<'static>> = app
         .sorted_indices()
         .into_iter()
-        .enumerate()
-        .map(|(pos, idx)| {
+        .map(|idx| {
             let m = &app.metrics[idx];
-            let row = project_row(m, (now - m.last_activity).num_seconds());
-            if pos == app.selected {
-                row.style(Style::default().add_modifier(Modifier::REVERSED))
-            } else {
-                row
-            }
+            project_row(m, (now - m.last_activity).num_seconds())
         })
         .collect();
 
@@ -107,6 +122,7 @@ fn project_table(app: &App) -> Table<'static> {
     ];
     Table::new(rows, widths)
         .header(header)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .block(Block::bordered().title("all projects"))
 }
 
@@ -138,7 +154,7 @@ fn momentum_label(closed_7d: u32, opened_7d: u32) -> String {
     let delta = closed_7d as i32 - opened_7d as i32;
     match delta {
         d if d > 0 => format!("+{d}↑"),
-        d if d < 0 => format!("{d}↓"),
+        d if d < 0 => format!("−{}↓", d.unsigned_abs()),
         _ => "0".to_string(),
     }
 }
@@ -201,6 +217,95 @@ mod tests {
         assert!(text.contains("TODAY'S PICK"), "missing hero label:\n{text}");
         assert!(text.contains("my-project"), "missing repo name:\n{text}");
         assert!(text.contains("q quit"), "missing keybind footer:\n{text}");
+    }
+
+    fn named_metric(name: &str, open: u32, closed_7d: u32) -> Metrics {
+        Metrics {
+            repo: RepoRef::parse(&format!("octo/{name}")).unwrap(),
+            next_milestone: None,
+            open_issues: open,
+            closed_7d,
+            opened_7d: 0,
+            last_activity: Utc::now() - Duration::hours(2),
+            releases_shipped: 1,
+        }
+    }
+
+    fn app_with(metrics: Vec<Metrics>, selected: usize) -> App {
+        let mut app = App::new(None, Sort::Name);
+        app.metrics = metrics;
+        app.selected = selected;
+        app
+    }
+
+    /// Index of the first buffer row whose text contains `needle`.
+    fn row_of(terminal: &Terminal<TestBackend>, needle: &str) -> Option<usize> {
+        buffer_text(terminal)
+            .lines()
+            .position(|line| line.contains(needle))
+    }
+
+    /// True when any cell of buffer row `y` is reversed (the highlight).
+    /// Uses `any`, not `all`: the row's border glyphs are never highlighted.
+    fn row_is_reversed(terminal: &Terminal<TestBackend>, y: usize) -> bool {
+        let buf = terminal.backend().buffer();
+        let width = buf.area.width as usize;
+        buf.content()[y * width..(y + 1) * width]
+            .iter()
+            .any(|c| c.modifier.contains(Modifier::REVERSED))
+    }
+
+    #[test]
+    fn renders_summary_totals() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let app = app_with(vec![named_metric("a", 4, 6), named_metric("b", 3, 2)], 0);
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("2 repos · 7 open issues · 8 closed this week · 2 releases shipped"),
+            "missing summary line:\n{text}"
+        );
+    }
+
+    #[test]
+    fn highlights_second_row_when_selected_is_one() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        let app = app_with(
+            vec![named_metric("first", 1, 0), named_metric("second", 1, 0)],
+            1,
+        );
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let first = row_of(&terminal, "first").expect("first row rendered");
+        let second = row_of(&terminal, "second").expect("second row rendered");
+        assert!(
+            row_is_reversed(&terminal, second),
+            "second row not highlighted"
+        );
+        assert!(
+            !row_is_reversed(&terminal, first),
+            "first row wrongly highlighted"
+        );
+    }
+
+    #[test]
+    fn scrolls_selected_row_into_view_when_below_fold() {
+        // Short terminal: only a few table rows fit; select the last of ten repos.
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        let metrics: Vec<Metrics> = (0..10)
+            .map(|i| named_metric(&format!("repo{i:02}"), 1, 0))
+            .collect();
+        let app = app_with(metrics, 9);
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let y = row_of(&terminal, "repo09").expect("selected row scrolled into view");
+        assert!(
+            row_is_reversed(&terminal, y),
+            "scrolled-in row not highlighted"
+        );
+    }
+
+    #[test]
+    fn renders_negative_momentum_with_minus_sign() {
+        assert_eq!(momentum_label(0, 3), "−3↓");
     }
 
     #[test]
